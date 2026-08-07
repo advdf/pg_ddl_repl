@@ -72,9 +72,10 @@ is($subscriber->safe_psql('postgres', "SELECT to_regclass('t_orders_v2')::text I
 # --- loop prevention: replaying DDL on the subscriber must not re-queue it there ---
 # The subscriber's own local CREATE TABLE t_orders was never captured at all
 # (no publish rule on the subscriber -- it only has subscribe_rules), so
-# source='subscriber' should have zero rows. If ddl_repl.applying had failed
-# to suppress the subscriber's own event triggers while replaying the
-# rename/drop, this would be nonzero instead.
+# source='subscriber' should have zero rows. If the loop-prevention check
+# (session_replication_role = 'replica' during apply) had failed to suppress
+# the subscriber's own event triggers while replaying the rename/drop, this
+# would be nonzero instead.
 is($subscriber->safe_psql('postgres',
         q(SELECT count(*) FROM ddl_repl.command_queue WHERE source_name = 'subscriber')),
     '0',

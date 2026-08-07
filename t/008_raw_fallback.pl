@@ -53,6 +53,33 @@ is($subscriber->safe_psql('postgres',
     '42',
     'alter_column_default IS replayed once the table opts in to raw fallback');
 
+# --- the replayed text is only the rebuilt SET DEFAULT statement, never the
+# whole client command string: in a compound ALTER TABLE, replaying
+# current_query() would re-run the sibling ADD COLUMN (without IF NOT
+# EXISTS) after its own structured replay already created the column,
+# erroring out and wedging the subscription -- catchup would then hang. ---
+$publisher->safe_psql('postgres',
+    'ALTER TABLE t_orders ADD COLUMN qty int, ALTER COLUMN amount SET DEFAULT 7');
+$publisher->wait_for_catchup('sub1');
+
+is($subscriber->safe_psql('postgres',
+        q(SELECT count(*) FROM information_schema.columns WHERE table_name = 't_orders' AND column_name = 'qty')),
+    '1',
+    'compound ALTER TABLE: the ADD COLUMN half replays via its own structured row');
+is($subscriber->safe_psql('postgres',
+        q(SELECT column_default FROM information_schema.columns WHERE table_name = 't_orders' AND column_name = 'amount')),
+    '7',
+    'compound ALTER TABLE: the SET DEFAULT half replays alone via raw fallback');
+
+# --- DROP DEFAULT round-trips too (no pg_attrdef row left at capture time) ---
+$publisher->safe_psql('postgres', 'ALTER TABLE t_orders ALTER COLUMN amount DROP DEFAULT');
+$publisher->wait_for_catchup('sub1');
+
+is($subscriber->safe_psql('postgres',
+        q(SELECT column_default IS NULL FROM information_schema.columns WHERE table_name = 't_orders' AND column_name = 'amount')),
+    't',
+    'DROP DEFAULT replays via the same rebuilt-statement fallback');
+
 $subscriber->stop;
 $publisher->stop;
 done_testing();

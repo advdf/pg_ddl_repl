@@ -4,15 +4,6 @@
 #include "fmgr.h"
 
 /*
- * PG16 centralized the _PG_init prototype in fmgr.h. On PG15 no such
- * declaration exists anywhere in core, so our definition trips
- * -Wmissing-prototypes unless we declare it ourselves.
- */
-#if PG_VERSION_NUM < 160000
-extern PGDLLEXPORT void _PG_init(void);
-#endif
-
-/*
  * AT_AddColumnRecurse / AT_DropColumnRecurse were folded into plain
  * AT_AddColumn / AT_DropColumn in PG16 (confirmed absent from PG17/18
  * headers, present in PG15's). Centralize the version-dependent match here

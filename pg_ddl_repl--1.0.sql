@@ -102,11 +102,14 @@ CREATE TABLE ddl_repl.subscribe_rules (
     object_family text NOT NULL CHECK (object_family IN ('table', 'column', 'index')),
     operation text NOT NULL,
     enabled boolean NOT NULL DEFAULT true,
-    -- Opt-in only: replay the verbatim captured command text for
-    -- operations without a structured deparse (currently just
-    -- 'alter_column_default') instead of leaving them as an audit-only,
-    -- unapplied row. Off by default -- the subscriber's schema-qualification
-    -- and search_path may not match the publisher's at replay time.
+    -- Opt-in only: replay the captured command text for operations without
+    -- a structured deparse (currently just 'alter_column_default') instead
+    -- of leaving them as an audit-only, unapplied row. The text is a single
+    -- statement rebuilt from the catalogs at capture time (see
+    -- build_alter_default_sql), never the client's verbatim input. Still
+    -- off by default -- names inside the default expression are rendered
+    -- relative to the publisher's search_path and may resolve differently
+    -- on the subscriber.
     allow_raw_fallback boolean NOT NULL DEFAULT false,
     CHECK ((schema_name IS NULL) = (table_name IS NULL)),
     UNIQUE NULLS NOT DISTINCT (source_name, schema_name, table_name, object_family, operation)
@@ -125,17 +128,27 @@ LANGUAGE sql STABLE AS $$
     )
 $$;
 
+-- Single source of truth for subscribe-side rule matching: the winning rule
+-- is the table-specific one when present, else the wildcard (the ORDER BY).
+-- is_subscribed and allows_raw_fallback both read their answer off this one
+-- row so the precedence logic cannot silently diverge between them.
+CREATE FUNCTION ddl_repl.match_subscribe_rule(p_source_name text, p_schema text, p_table text, p_family text, p_operation text)
+RETURNS ddl_repl.subscribe_rules
+LANGUAGE sql STABLE AS $$
+    SELECT r FROM ddl_repl.subscribe_rules r
+    WHERE r.source_name = p_source_name
+      AND r.object_family = p_family AND r.operation = p_operation
+      AND ((r.schema_name = p_schema AND r.table_name = p_table)
+           OR (r.schema_name IS NULL AND r.table_name IS NULL))
+    ORDER BY (r.schema_name IS NULL) ASC
+    LIMIT 1
+$$;
+
 CREATE FUNCTION ddl_repl.is_subscribed(p_source_name text, p_schema text, p_table text, p_family text, p_operation text)
 RETURNS boolean
 LANGUAGE sql STABLE AS $$
     SELECT coalesce(
-        (SELECT enabled FROM ddl_repl.subscribe_rules
-         WHERE source_name = p_source_name
-           AND object_family = p_family AND operation = p_operation
-           AND ((schema_name = p_schema AND table_name = p_table)
-                OR (schema_name IS NULL AND table_name IS NULL))
-         ORDER BY (schema_name IS NULL) ASC
-         LIMIT 1),
+        (ddl_repl.match_subscribe_rule(p_source_name, p_schema, p_table, p_family, p_operation)).enabled,
         false
     )
 $$;
@@ -144,13 +157,7 @@ CREATE FUNCTION ddl_repl.allows_raw_fallback(p_source_name text, p_schema text, 
 RETURNS boolean
 LANGUAGE sql STABLE AS $$
     SELECT coalesce(
-        (SELECT allow_raw_fallback FROM ddl_repl.subscribe_rules
-         WHERE source_name = p_source_name
-           AND object_family = p_family AND operation = p_operation
-           AND ((schema_name = p_schema AND table_name = p_table)
-                OR (schema_name IS NULL AND table_name IS NULL))
-         ORDER BY (schema_name IS NULL) ASC
-         LIMIT 1),
+        (ddl_repl.match_subscribe_rule(p_source_name, p_schema, p_table, p_family, p_operation)).allow_raw_fallback,
         false
     )
 $$;
@@ -201,6 +208,31 @@ LANGUAGE sql AS $$
     ON CONFLICT (source_name, schema_name, table_name, object_family, operation) DO UPDATE SET enabled = true
 $$;
 
+-- Rebuild a single, self-contained, fully table-qualified ALTER ... SET/DROP
+-- DEFAULT statement from the catalogs. By ddl_command_end time the new
+-- default is already committed to pg_attrdef, so the expression can be read
+-- back with pg_get_expr (no adbin row left = it was a DROP DEFAULT). Never
+-- current_query(): that is the client's whole command string, which may
+-- batch unrelated statements or sibling ALTER TABLE subcommands the
+-- per-operation filter never approved -- replaying it verbatim on the
+-- subscriber would execute them all.
+CREATE FUNCTION ddl_repl.build_alter_default_sql(p_relid oid, p_column text)
+RETURNS text
+LANGUAGE sql STABLE AS $$
+    SELECT CASE WHEN d.adbin IS NOT NULL THEN
+        format('ALTER TABLE IF EXISTS %I.%I ALTER COLUMN %I SET DEFAULT %s',
+               n.nspname, c.relname, a.attname, pg_get_expr(d.adbin, d.adrelid))
+    ELSE
+        format('ALTER TABLE IF EXISTS %I.%I ALTER COLUMN %I DROP DEFAULT',
+               n.nspname, c.relname, a.attname)
+    END
+    FROM pg_catalog.pg_class c
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attname = p_column
+    LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid = c.oid AND d.adnum = a.attnum
+    WHERE c.oid = p_relid
+$$;
+
 CREATE FUNCTION ddl_repl.capture_ddl_command_end()
 RETURNS event_trigger
 LANGUAGE plpgsql
@@ -214,8 +246,15 @@ DECLARE
         current_database()
     );
 BEGIN
-    -- Loop-prevention: skip capture while replaying a command received from a subscription.
-    IF current_setting('ddl_repl.applying', true)::boolean THEN
+    -- Loop-prevention: logical replication apply workers run with
+    -- session_replication_role = 'replica' (the same fact ENABLE REPLICA
+    -- TRIGGER relies on), so DDL being replayed from a subscription is
+    -- recognizable here and skipped -- otherwise a subscriber re-executing
+    -- DDL would recapture and re-queue it, looping forever in any
+    -- bidirectional/cascading setup. session_replication_role is
+    -- superuser-only (SUSET); a custom USERSET GUC here would let any role
+    -- silently exempt its own DDL from capture and replication.
+    IF current_setting('session_replication_role') = 'replica' THEN
         RETURN;
     END IF;
 
@@ -258,10 +297,10 @@ BEGIN
                         'type_name', line.type_name,
                         -- Only 'alter_column_default' relies on this: the new
                         -- default expression isn't deparsed structurally (see
-                        -- deparse_column.c), so the verbatim command text is
+                        -- deparse_column.c), so a single rebuilt statement is
                         -- kept as an opt-in raw-replay fallback.
                         'ddl_text', CASE WHEN line.operation = 'alter_column_default'
-                                         THEN current_query() END
+                                         THEN ddl_repl.build_alter_default_sql(line.table_oid, line.column_name) END
                     )
                 );
             END IF;
@@ -320,7 +359,10 @@ DECLARE
         current_database()
     );
 BEGIN
-    IF current_setting('ddl_repl.applying', true)::boolean THEN
+    -- Same loop-prevention as capture_ddl_command_end: skip while a
+    -- subscription apply worker (session_replication_role = 'replica') is
+    -- replaying a command.
+    IF current_setting('session_replication_role') = 'replica' THEN
         RETURN;
     END IF;
 
@@ -430,6 +472,7 @@ DECLARE
     v_index text := NEW.payload->>'index_name';
     v_index_def text := NEW.payload->>'index_def';
     v_sql text;
+    v_old_path text;
 BEGIN
     IF v_family NOT IN ('table', 'column', 'index') THEN
         RETURN NEW;
@@ -467,12 +510,15 @@ BEGIN
             -- ddl_repl.enable_raw_fallback).
             IF ddl_repl.allows_raw_fallback(NEW.source_name, v_schema, v_table, v_family, v_op) THEN
                 v_sql := NEW.payload->>'ddl_text';
-                -- The captured text is verbatim and unqualified (whatever
-                -- the DBA actually typed on the publisher) -- the apply
-                -- worker's session doesn't necessarily have the same
-                -- search_path, confirmed empirically ("relation t_orders
-                -- does not exist" with search_path left at its default).
-                PERFORM set_config('search_path', v_schema, true);
+                -- ddl_text fully qualifies the table (see
+                -- build_alter_default_sql), but names *inside* the default
+                -- expression are rendered by pg_get_expr relative to the
+                -- publisher's search_path -- approximate that here with the
+                -- table's schema (quoted: it may need it), and restore the
+                -- previous path after EXECUTE so it can't leak into later
+                -- rows applied in this same transaction.
+                v_old_path := current_setting('search_path');
+                PERFORM set_config('search_path', quote_ident(v_schema), true);
             ELSE
                 v_sql := NULL;
             END IF;
@@ -490,8 +536,14 @@ BEGIN
     END CASE;
 
     IF v_sql IS NOT NULL THEN
-        PERFORM set_config('ddl_repl.applying', 'on', true);
+        -- No loop-prevention flag to set here: this trigger only ever fires
+        -- under session_replication_role = 'replica' (ENABLE REPLICA
+        -- TRIGGER), which is exactly what the capture triggers check.
         EXECUTE v_sql;
+
+        IF v_old_path IS NOT NULL THEN
+            PERFORM set_config('search_path', v_old_path, true);
+        END IF;
 
         UPDATE ddl_repl.command_queue
             SET applied_at = now()
