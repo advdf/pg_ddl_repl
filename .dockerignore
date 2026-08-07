@@ -1,0 +1,10 @@
+.git
+.github
+graphify-out
+tmp_check
+results
+*.o
+*.so
+*.bc
+CLAUDE.md
+CLAUDE.local.md

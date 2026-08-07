@@ -96,4 +96,11 @@ TAP tests via `PostgreSQL::Test::Cluster` (`t/*.pl`) — the only realistic way 
 make installcheck
 ```
 
+No local PostgreSQL source build handy? The CI image (also used by GitHub Actions, see `.github/workflows/ci.yml`) builds one from source and runs the suite:
+
+```sh
+docker build -f ci/Dockerfile --build-arg PG_VERSION=17.5 -t pg_ddl_repl-ci .
+docker run --rm pg_ddl_repl-ci
+```
+
 Covers: table/column/index capture and replay, filtering (publish- and subscribe-side, default-deny, wildcard-vs-specific precedence), the opt-in raw-text fallback, multi-subscriber fan-out with independent filter sets, and same-transaction DDL+DML ordering.

@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: PostgreSQL ${{ matrix.pg }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # One entry per supported major; bump the minors here.
+        pg: ["15.13", "16.9", "17.5", "18.0"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # The PostgreSQL source build dominates the time; its layer is cached
+      # per major/minor (scope), so a typical run only rebuilds the
+      # extension layers.
+      - name: Build image (PostgreSQL ${{ matrix.pg }} + extension)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ci/Dockerfile
+          build-args: |
+            PG_VERSION=${{ matrix.pg }}
+          tags: pg_ddl_repl:ci
+          load: true
+          cache-from: type=gha,scope=pg${{ matrix.pg }}
+          cache-to: type=gha,scope=pg${{ matrix.pg }},mode=max
+
+      - name: make installcheck (TAP)
+        run: docker run --rm pg_ddl_repl:ci
