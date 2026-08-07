@@ -1,0 +1,36 @@
+{
+   "name": "pg_ddl_repl",
+   "abstract": "DDL replication on top of native PostgreSQL logical replication",
+   "description": "Captures DDL transparently via event triggers and replicates it over an ordinary table riding a native logical replication publication, with default-deny per-table filtering across table/column/index families.",
+   "version": "1.0.0",
+   "maintainer": [
+      "pg_ddl_repl contributors"
+   ],
+   "license": "postgresql",
+   "provides": {
+      "pg_ddl_repl": {
+         "abstract": "DDL replication on top of native PostgreSQL logical replication",
+         "file": "pg_ddl_repl--1.0.sql",
+         "docfile": "README.md",
+         "version": "1.0.0"
+      }
+   },
+   "prereqs": {
+      "runtime": {
+         "requires": {
+            "PostgreSQL": "15.0.0"
+         }
+      }
+   },
+   "generated_by": "pg_ddl_repl contributors",
+   "meta-spec": {
+      "version": "1.0.0",
+      "url": "https://pgxn.org/meta/spec.txt"
+   },
+   "tags": [
+      "logical replication",
+      "ddl",
+      "schema",
+      "replication"
+   ]
+}

@@ -1,0 +1,9 @@
+*.o
+*.so
+*.dylib
+*.bc
+tmp_check/
+results/
+regression.diffs
+regression.out
+log/

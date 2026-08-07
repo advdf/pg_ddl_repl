@@ -1,0 +1,4 @@
+comment = 'Transparent DDL replication over native PostgreSQL logical replication'
+default_version = '1.0'
+module_pathname = '$libdir/pg_ddl_repl'
+relocatable = false
