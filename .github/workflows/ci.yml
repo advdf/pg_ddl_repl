@@ -1,8 +1,11 @@
 name: CI
 
+# push has no branch filter so that fork branches get CI runs on the fork
+# itself, without waiting for the upstream repo to approve the PR workflow.
+# (For a branch pushed to this repo AND opened as a same-repo PR, this means
+# a duplicate run -- acceptable, contributions are expected via forks.)
 on:
   push:
-    branches: [main]
   pull_request:
 
 jobs:
