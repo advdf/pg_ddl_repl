@@ -102,6 +102,16 @@ is($publisher->safe_psql('postgres',
     '0',
     q(applied_at stays NULL on the publisher's own rows -- only a subscriber's apply trigger stamps it));
 
+# --- purge: publisher-side deletes replicate and clean the subscriber's copy too ---
+is($publisher->safe_psql('postgres', q(SELECT ddl_repl.purge_queue('0 seconds'))),
+    '3',
+    'purge_queue reports the publisher rows it deleted');
+$publisher->wait_for_catchup('sub1');
+is($subscriber->safe_psql('postgres',
+        q(SELECT count(*) FROM ddl_repl.command_queue WHERE source_name = 'publisher')),
+    '0',
+    q(the purge DELETEs rode the publication and emptied the subscriber's copy));
+
 $subscriber->stop;
 $publisher->stop;
 done_testing();

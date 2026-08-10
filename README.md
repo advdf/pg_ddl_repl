@@ -60,6 +60,14 @@ SELECT ddl_repl.subscribe_table('my_publisher_source_name', 'public', 'orders');
 
 `my_publisher_source_name` defaults to the publisher's `cluster_name` GUC (falling back to its database name if unset) — override explicitly with the `ddl_repl.source_name` GUC if that's ambiguous in your topology.
 
+### Housekeeping
+
+`command_queue` keeps one row per captured DDL, forever, on both sides. Purge periodically **on the publisher** — the deletes ride the publication and clean the subscribers' copies too:
+
+```sql
+SELECT ddl_repl.purge_queue('30 days');  -- returns rows purged
+```
+
 ## Filtering model
 
 Everything is **default-deny**: a captured command is published (and, independently, applied on each subscriber) only if an `enabled` row matches. A table-specific row always wins over a database-wide wildcard (`relid`/`schema_name`+`table_name` `NULL`) for the same family+operation, so a table can override a general "yes" with an explicit "no", or vice versa.
@@ -81,7 +89,7 @@ Operations per family:
 - **`alter_column_default` is audit-only unless a table opts in.** The new default expression isn't deparsed structurally (would require core's general expression deparser, out of scope for v1). Opt in with `ddl_repl.enable_raw_fallback(source_name, schema, table)` to replay the captured text instead — a single `ALTER ... SET/DROP DEFAULT` statement rebuilt from the catalogs at capture time (fully table-qualified, never the client's verbatim input). Still off by default because names *inside* the default expression are rendered relative to the publisher's `search_path` and may resolve differently on the subscriber.
 - **Renaming a table invalidates subscribe-side rules keyed on the old name.** Since `subscribe_rules` keys on name, a `drop_table` (or any later operation) on the renamed table needs its own rule for the *new* name.
 - **Constraints (`NOT NULL`, `CHECK`) are not captured at all.** `logical_ddl` doesn't handle these either; deparsing them correctly (named vs. auto-named constraints) is nontrivial and deferred.
-- **Topology is simple 1 publisher → N subscribers.** Loop prevention keys off `session_replication_role = 'replica'` (how apply workers always run, and superuser-only — no unprivileged role can set it to sneak DDL past capture); true bidirectional replication, where each side both publishes and subscribes the same tables, would need more than that.
+- **Topology is simple 1 publisher → N subscribers.** Loop prevention keys off `session_replication_role = 'replica'` (how apply workers always run). It is a SUSET parameter: superuser-only by default, though on PG15+ a superuser can delegate it with `GRANT SET ON PARAMETER session_replication_role` — any role holding that grant (or setting the role for bulk-load/ETL purposes) runs its DDL outside capture. True bidirectional replication, where each side both publishes and subscribes the same tables, would need more than this.
 - **No automated crash/restart idempotency test.** The apply path guards with `IF EXISTS`/`IF NOT EXISTS` and a `(source_name, id)` primary key, but this hasn't been exercised under an actual subscriber crash-and-replay in CI.
 
 ## Architecture, in one paragraph
