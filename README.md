@@ -78,10 +78,10 @@ Operations per family:
 ## Known v1 limitations
 
 - **`create_table` is audit-only, never replayed.** The structured deparse doesn't capture a column list (see `src/deparse_table.c`). The DBA is expected to pre-create tables on subscribers before subscribing, same as native logical replication already requires for DML.
-- **`alter_column_default` is audit-only unless a table opts in.** The new default expression isn't deparsed structurally (would require core's general expression deparser, out of scope for v1). Opt in with `ddl_repl.enable_raw_fallback(source_name, schema, table)` to replay the verbatim captured command text instead — off by default because the subscriber's `search_path`/schema-qualification may not match the publisher's exactly.
+- **`alter_column_default` is audit-only unless a table opts in.** The new default expression isn't deparsed structurally (would require core's general expression deparser, out of scope for v1). Opt in with `ddl_repl.enable_raw_fallback(source_name, schema, table)` to replay the captured text instead — a single `ALTER ... SET/DROP DEFAULT` statement rebuilt from the catalogs at capture time (fully table-qualified, never the client's verbatim input). Still off by default because names *inside* the default expression are rendered relative to the publisher's `search_path` and may resolve differently on the subscriber.
 - **Renaming a table invalidates subscribe-side rules keyed on the old name.** Since `subscribe_rules` keys on name, a `drop_table` (or any later operation) on the renamed table needs its own rule for the *new* name.
 - **Constraints (`NOT NULL`, `CHECK`) are not captured at all.** `logical_ddl` doesn't handle these either; deparsing them correctly (named vs. auto-named constraints) is nontrivial and deferred.
-- **Topology is simple 1 publisher → N subscribers.** Loop prevention is a session-local GUC (`ddl_repl.applying`); bidirectional/cascading replication would need it hardened further.
+- **Topology is simple 1 publisher → N subscribers.** Loop prevention keys off `session_replication_role = 'replica'` (how apply workers always run, and superuser-only — no unprivileged role can set it to sneak DDL past capture); true bidirectional replication, where each side both publishes and subscribes the same tables, would need more than that.
 - **No automated crash/restart idempotency test.** The apply path guards with `IF EXISTS`/`IF NOT EXISTS` and a `(source_name, id)` primary key, but this hasn't been exercised under an actual subscriber crash-and-replay in CI.
 
 ## Architecture, in one paragraph
@@ -94,6 +94,13 @@ TAP tests via `PostgreSQL::Test::Cluster` (`t/*.pl`) — the only realistic way 
 
 ```sh
 make installcheck
+```
+
+No local PostgreSQL source build handy? The CI image (also used by GitHub Actions, see `.github/workflows/ci.yml`) builds one from source and runs the suite:
+
+```sh
+docker build -f ci/Dockerfile --build-arg PG_VERSION=17.5 -t pg_ddl_repl-ci .
+docker run --rm pg_ddl_repl-ci
 ```
 
 Covers: table/column/index capture and replay, filtering (publish- and subscribe-side, default-deny, wildcard-vs-specific precedence), the opt-in raw-text fallback, multi-subscriber fan-out with independent filter sets, and same-transaction DDL+DML ordering.

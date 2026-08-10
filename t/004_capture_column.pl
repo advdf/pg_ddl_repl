@@ -33,8 +33,8 @@ is($rows,
 
 is($node->safe_psql('postgres',
         q(SELECT payload->>'ddl_text' FROM ddl_repl.command_queue WHERE payload->>'operation' = 'alter_column_default')),
-    'ALTER TABLE t_orders ALTER COLUMN total_amount SET DEFAULT 0',
-    'alter_column_default keeps the verbatim command text as a fallback');
+    'ALTER TABLE IF EXISTS public.t_orders ALTER COLUMN total_amount SET DEFAULT 0',
+    'alter_column_default keeps a rebuilt, fully-qualified single statement as a fallback');
 
 is($node->safe_psql('postgres',
         "SELECT count(*) FROM ddl_repl.command_queue WHERE payload->>'object_family' = 'table'"),
