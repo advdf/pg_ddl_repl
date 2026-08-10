@@ -117,7 +117,9 @@ CREATE TABLE ddl_repl.subscribe_rules (
 
 CREATE FUNCTION ddl_repl.is_published(p_relid oid, p_family text, p_operation text)
 RETURNS boolean
-LANGUAGE sql STABLE AS $$
+LANGUAGE sql STABLE
+SET search_path = pg_catalog, ddl_repl
+AS $$
     SELECT coalesce(
         (SELECT enabled FROM ddl_repl.publish_rules
          WHERE object_family = p_family AND operation = p_operation
@@ -134,7 +136,9 @@ $$;
 -- row so the precedence logic cannot silently diverge between them.
 CREATE FUNCTION ddl_repl.match_subscribe_rule(p_source_name text, p_schema text, p_table text, p_family text, p_operation text)
 RETURNS ddl_repl.subscribe_rules
-LANGUAGE sql STABLE AS $$
+LANGUAGE sql STABLE
+SET search_path = pg_catalog, ddl_repl
+AS $$
     SELECT r FROM ddl_repl.subscribe_rules r
     WHERE r.source_name = p_source_name
       AND r.object_family = p_family AND r.operation = p_operation
@@ -146,7 +150,9 @@ $$;
 
 CREATE FUNCTION ddl_repl.is_subscribed(p_source_name text, p_schema text, p_table text, p_family text, p_operation text)
 RETURNS boolean
-LANGUAGE sql STABLE AS $$
+LANGUAGE sql STABLE
+SET search_path = pg_catalog, ddl_repl
+AS $$
     SELECT coalesce(
         (ddl_repl.match_subscribe_rule(p_source_name, p_schema, p_table, p_family, p_operation)).enabled,
         false
@@ -155,7 +161,9 @@ $$;
 
 CREATE FUNCTION ddl_repl.allows_raw_fallback(p_source_name text, p_schema text, p_table text, p_family text, p_operation text)
 RETURNS boolean
-LANGUAGE sql STABLE AS $$
+LANGUAGE sql STABLE
+SET search_path = pg_catalog, ddl_repl
+AS $$
     SELECT coalesce(
         (ddl_repl.match_subscribe_rule(p_source_name, p_schema, p_table, p_family, p_operation)).allow_raw_fallback,
         false
@@ -164,17 +172,31 @@ $$;
 
 CREATE FUNCTION ddl_repl.enable_raw_fallback(p_source_name text, p_schema text, p_table text, p_operation text DEFAULT 'alter_column_default')
 RETURNS void
-LANGUAGE sql AS $$
+LANGUAGE plpgsql
+SET search_path = pg_catalog, ddl_repl
+AS $$
+BEGIN
     UPDATE ddl_repl.subscribe_rules SET allow_raw_fallback = true
     WHERE source_name = p_source_name AND schema_name = p_schema AND table_name = p_table
-      AND object_family = 'column' AND operation = p_operation
+      AND object_family = 'column' AND operation = p_operation;
+
+    -- A silent no-op here is a trap: called before subscribe_table() (so no
+    -- rule row exists yet), the DBA believes the fallback is armed while
+    -- nothing will ever replay. Fail loudly instead.
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'no subscribe rule for source %, table %.%, operation % -- call ddl_repl.subscribe_table() first',
+            p_source_name, p_schema, p_table, p_operation;
+    END IF;
+END
 $$;
 
 -- Convenience: enable every known operation, across all 3 families, for one
 -- table (publish side) or one (source, table) pair (subscribe side).
 CREATE FUNCTION ddl_repl.publish_table(p_relid oid)
 RETURNS void
-LANGUAGE sql AS $$
+LANGUAGE sql
+SET search_path = pg_catalog, ddl_repl
+AS $$
     INSERT INTO ddl_repl.publish_rules (relid, object_family, operation)
     VALUES
         (p_relid, 'table', 'create_table'),
@@ -192,7 +214,9 @@ $$;
 
 CREATE FUNCTION ddl_repl.subscribe_table(p_source_name text, p_schema text, p_table text)
 RETURNS void
-LANGUAGE sql AS $$
+LANGUAGE sql
+SET search_path = pg_catalog, ddl_repl
+AS $$
     INSERT INTO ddl_repl.subscribe_rules (source_name, schema_name, table_name, object_family, operation)
     VALUES
         (p_source_name, p_schema, p_table, 'table', 'create_table'),
@@ -218,7 +242,9 @@ $$;
 -- subscriber would execute them all.
 CREATE FUNCTION ddl_repl.build_alter_default_sql(p_relid oid, p_column text)
 RETURNS text
-LANGUAGE sql STABLE AS $$
+LANGUAGE sql STABLE
+SET search_path = pg_catalog, ddl_repl
+AS $$
     SELECT CASE WHEN d.adbin IS NOT NULL THEN
         format('ALTER TABLE IF EXISTS %I.%I ALTER COLUMN %I SET DEFAULT %s',
                n.nspname, c.relname, a.attname, pg_get_expr(d.adbin, d.adrelid))
@@ -236,6 +262,7 @@ $$;
 CREATE FUNCTION ddl_repl.capture_ddl_command_end()
 RETURNS event_trigger
 LANGUAGE plpgsql
+SET search_path = pg_catalog, ddl_repl
 AS $$
 DECLARE
     obj record;
@@ -309,7 +336,7 @@ BEGIN
         FOR line IN SELECT * FROM ddl_repl.deparse_index(obj.command)
         LOOP
             DECLARE
-                v_table_oid oid := (SELECT indrelid FROM pg_index WHERE indexrelid = line.index_oid);
+                v_table_oid oid := (SELECT indrelid FROM pg_catalog.pg_index WHERE indexrelid = line.index_oid);
             BEGIN
                 IF ddl_repl.is_published(v_table_oid, 'index', line.operation) THEN
                     INSERT INTO ddl_repl.index_table_map (index_oid, table_oid, schema_name, table_name)
@@ -326,7 +353,7 @@ BEGIN
                             'schema_name', obj.schema_name,
                             'table_name', line.table_name,
                             'table_oid', v_table_oid,
-                            'index_name', (SELECT relname FROM pg_class WHERE oid = line.index_oid),
+                            'index_name', (SELECT relname FROM pg_catalog.pg_class WHERE oid = line.index_oid),
                             -- Full CREATE INDEX text from the OID, not
                             -- hand-walked from the parse tree -- see
                             -- deparse_index.c.
@@ -350,6 +377,7 @@ CREATE EVENT TRIGGER ddl_repl_capture_ddl_command_end
 CREATE FUNCTION ddl_repl.capture_sql_drop()
 RETURNS event_trigger
 LANGUAGE plpgsql
+SET search_path = pg_catalog, ddl_repl
 AS $$
 DECLARE
     obj record;
@@ -438,11 +466,32 @@ CREATE EVENT TRIGGER ddl_repl_capture_sql_drop
     ON sql_drop
     EXECUTE FUNCTION ddl_repl.capture_sql_drop();
 
+-- The queue grows forever otherwise -- one row per captured DDL, on both
+-- sides. Run on the PUBLISHER: command_queue rides the publication, so the
+-- DELETEs replicate and clean the subscribers' copies too (the apply
+-- trigger is AFTER INSERT only, deletes replay as plain deletes). Returns
+-- the number of rows purged locally.
+CREATE FUNCTION ddl_repl.purge_queue(retention interval DEFAULT '30 days')
+RETURNS bigint
+LANGUAGE plpgsql
+SET search_path = pg_catalog, ddl_repl
+AS $$
+DECLARE
+    v_purged bigint;
+BEGIN
+    DELETE FROM ddl_repl.command_queue
+    WHERE captured_at < now() - retention;
+    GET DIAGNOSTICS v_purged = ROW_COUNT;
+    RETURN v_purged;
+END
+$$;
+
 -- Manual step: the extension can't guess which publication a DBA wants the
 -- shadow queue table riding on at CREATE EXTENSION time.
 CREATE FUNCTION ddl_repl.enable_for_publication(pubname text)
 RETURNS void
 LANGUAGE plpgsql
+SET search_path = pg_catalog, ddl_repl
 AS $$
 BEGIN
     IF current_setting('wal_level') <> 'logical' THEN
@@ -460,6 +509,7 @@ $$;
 CREATE FUNCTION ddl_repl.apply_command()
 RETURNS trigger
 LANGUAGE plpgsql
+SET search_path = pg_catalog, ddl_repl
 AS $$
 DECLARE
     v_family text := NEW.payload->>'object_family';

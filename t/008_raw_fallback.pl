@@ -43,7 +43,13 @@ is($subscriber->safe_psql('postgres',
     '0',
     'the unreplayed row stays unmarked as applied');
 
-# --- with opt-in: the verbatim command text is replayed ---
+# --- opting in on a table with no subscribe rule fails loudly, never silently ---
+my ($ret, $out, $err) = $subscriber->psql('postgres',
+    q(SELECT ddl_repl.enable_raw_fallback('publisher', 'public', 'no_such_table')));
+isnt($ret, 0, 'enable_raw_fallback on a table without a subscribe rule raises instead of silently doing nothing');
+like($err, qr/no subscribe rule/, 'the error names the missing rule');
+
+# --- with opt-in: the rebuilt single-statement text is replayed ---
 $subscriber->safe_psql('postgres', q(SELECT ddl_repl.enable_raw_fallback('publisher', 'public', 't_orders')));
 $publisher->safe_psql('postgres', 'ALTER TABLE t_orders ALTER COLUMN amount SET DEFAULT 42');
 $publisher->wait_for_catchup('sub1');
