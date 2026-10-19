@@ -45,7 +45,7 @@ is($subscriber->safe_psql('postgres',
     '0', 'no subscribe rule left on the old table name');
 is($subscriber->safe_psql('postgres',
         q(SELECT count(*) FROM ddl_repl.subscribe_rules WHERE source_name = 'other_source' AND table_name = 't_orders_v2')),
-    '10', 'rules of other sources on the same table follow the rename too');
+    '21', 'rules of other sources on the same table follow the rename too');
 
 $publisher->safe_psql('postgres', 'ALTER TABLE t_orders_v2 ADD COLUMN amount int');
 $publisher->safe_psql('postgres', q(INSERT INTO t_orders_v2 VALUES (1, 'a', 42)));

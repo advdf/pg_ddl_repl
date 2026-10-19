@@ -174,6 +174,19 @@ ddl_repl_deparse_column(PG_FUNCTION_ARGS)
 				values[6] = get_using_expr(subcmd, atstmt->relation->relname, cmd->d.alterTable.objectId);
 				matched = true;
 			}
+			else if (subcmd->subtype == AT_SetNotNull)
+			{
+				values[0] = "set_not_null";
+				matched = true;
+			}
+#ifndef DDL_REPL_NOT_NULL_IS_CONSTRAINT
+			/* On PG18 the dropped not-null constraint is the single source, captured from sql_drop. */
+			else if (subcmd->subtype == AT_DropNotNull)
+			{
+				values[0] = "drop_not_null";
+				matched = true;
+			}
+#endif
 			else if (subcmd->subtype == AT_ColumnDefault)
 			{
 				values[0] = "alter_column_default";

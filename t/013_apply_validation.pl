@@ -76,6 +76,12 @@ rejected(q({"schema_version": 1, "object_family": "column", "operation": "alter_
     qr/replicated command must be a single statement/, 'using_expr with a second statement');
 is(exists_rel('pwned_using'), 'f', 'using_expr cannot smuggle a second statement');
 
+rejected(q({"schema_version": 1, "object_family": "constraint", "operation": "add_constraint",
+          "schema_name": "public", "table_name": "t", "constraint_name": "t_a_check",
+          "constraint_def": "CHECK (a > 0); CREATE TABLE pwned_constraint (x int)"}),
+    qr/replicated command must be a single statement/, 'constraint_def with a second statement');
+is(exists_rel('pwned_constraint'), 'f', 'constraint_def cannot smuggle a second statement');
+
 my ($ok_ret) = replay(q({"schema_version": 1, "object_family": "column", "operation": "alter_column_type",
           "schema_name": "public", "table_name": "t", "column_name": "a",
           "type_name": "numeric(12,4)"}));

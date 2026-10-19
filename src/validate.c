@@ -70,13 +70,12 @@ ddl_repl_checked_index_def(PG_FUNCTION_ARGS)
 	PG_RETURN_TEXT_P(PG_GETARG_TEXT_PP(0));
 }
 
-static void
-check_alter_column(const char *sql, const char *schema, const char *table, const char *column,
-				   AlterTableType subtype, const char *what)
+/* The one ALTER TABLE subcommand of a replicated statement, on the expected table. */
+static AlterTableCmd *
+single_alter_table_cmd(const char *sql, const char *schema, const char *table, const char *what)
 {
 	Node	   *stmt = single_statement(sql);
 	AlterTableStmt *alter;
-	AlterTableCmd *cmd;
 
 	if (!IsA(stmt, AlterTableStmt) || ((AlterTableStmt *) stmt)->objtype != OBJECT_TABLE)
 		ereport(ERROR,
@@ -89,11 +88,32 @@ check_alter_column(const char *sql, const char *schema, const char *table, const
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("pg_ddl_repl: replicated %s must have a single subcommand", what)));
-	cmd = linitial_node(AlterTableCmd, alter->cmds);
-	if (cmd->subtype != subtype || cmd->name == NULL || strcmp(cmd->name, column) != 0)
+	return linitial_node(AlterTableCmd, alter->cmds);
+}
+
+static void
+check_subcommand(const AlterTableCmd *cmd, AlterTableType subtype, const char *name, const char *expected,
+				 const char *what)
+{
+	if (cmd->subtype != subtype || name == NULL || strcmp(name, expected) != 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("pg_ddl_repl: replicated %s does not target column \"%s\"", what, column)));
+				 errmsg("pg_ddl_repl: replicated %s does not target \"%s\"", what, expected)));
+}
+
+PG_FUNCTION_INFO_V1(ddl_repl_checked_add_constraint);
+
+Datum
+ddl_repl_checked_add_constraint(PG_FUNCTION_ARGS)
+{
+	char	   *constraint = text_to_cstring(PG_GETARG_TEXT_PP(3));
+	AlterTableCmd *cmd = single_alter_table_cmd(text_to_cstring(PG_GETARG_TEXT_PP(0)),
+												text_to_cstring(PG_GETARG_TEXT_PP(1)),
+												text_to_cstring(PG_GETARG_TEXT_PP(2)), "constraint");
+	const char *name = (cmd->def != NULL && IsA(cmd->def, Constraint)) ? ((Constraint *) cmd->def)->conname : NULL;
+
+	check_subcommand(cmd, AT_AddConstraint, name, constraint, "constraint");
+	PG_RETURN_TEXT_P(PG_GETARG_TEXT_PP(0));
 }
 
 PG_FUNCTION_INFO_V1(ddl_repl_checked_alter_default);
@@ -101,9 +121,12 @@ PG_FUNCTION_INFO_V1(ddl_repl_checked_alter_default);
 Datum
 ddl_repl_checked_alter_default(PG_FUNCTION_ARGS)
 {
-	check_alter_column(text_to_cstring(PG_GETARG_TEXT_PP(0)), text_to_cstring(PG_GETARG_TEXT_PP(1)),
-					   text_to_cstring(PG_GETARG_TEXT_PP(2)), text_to_cstring(PG_GETARG_TEXT_PP(3)),
-					   AT_ColumnDefault, "default change");
+	char	   *column = text_to_cstring(PG_GETARG_TEXT_PP(3));
+	AlterTableCmd *cmd = single_alter_table_cmd(text_to_cstring(PG_GETARG_TEXT_PP(0)),
+												text_to_cstring(PG_GETARG_TEXT_PP(1)),
+												text_to_cstring(PG_GETARG_TEXT_PP(2)), "default change");
+
+	check_subcommand(cmd, AT_ColumnDefault, cmd->name, column, "default change");
 	PG_RETURN_TEXT_P(PG_GETARG_TEXT_PP(0));
 }
 
@@ -112,8 +135,41 @@ PG_FUNCTION_INFO_V1(ddl_repl_checked_alter_type);
 Datum
 ddl_repl_checked_alter_type(PG_FUNCTION_ARGS)
 {
-	check_alter_column(text_to_cstring(PG_GETARG_TEXT_PP(0)), text_to_cstring(PG_GETARG_TEXT_PP(1)),
-					   text_to_cstring(PG_GETARG_TEXT_PP(2)), text_to_cstring(PG_GETARG_TEXT_PP(3)),
-					   AT_AlterColumnType, "type change");
+	char	   *column = text_to_cstring(PG_GETARG_TEXT_PP(3));
+	AlterTableCmd *cmd = single_alter_table_cmd(text_to_cstring(PG_GETARG_TEXT_PP(0)),
+												text_to_cstring(PG_GETARG_TEXT_PP(1)),
+												text_to_cstring(PG_GETARG_TEXT_PP(2)), "type change");
+
+	check_subcommand(cmd, AT_AlterColumnType, cmd->name, column, "type change");
+	PG_RETURN_TEXT_P(PG_GETARG_TEXT_PP(0));
+}
+
+PG_FUNCTION_INFO_V1(ddl_repl_checked_add_column);
+
+Datum
+ddl_repl_checked_add_column(PG_FUNCTION_ARGS)
+{
+	char	   *column = text_to_cstring(PG_GETARG_TEXT_PP(3));
+	AlterTableCmd *cmd = single_alter_table_cmd(text_to_cstring(PG_GETARG_TEXT_PP(0)),
+												text_to_cstring(PG_GETARG_TEXT_PP(1)),
+												text_to_cstring(PG_GETARG_TEXT_PP(2)), "column addition");
+	const char *name = (cmd->def != NULL && IsA(cmd->def, ColumnDef)) ? ((ColumnDef *) cmd->def)->colname : NULL;
+
+	check_subcommand(cmd, AT_AddColumn, name, column, "column addition");
+	PG_RETURN_TEXT_P(PG_GETARG_TEXT_PP(0));
+}
+
+PG_FUNCTION_INFO_V1(ddl_repl_checked_attach_partition);
+
+Datum
+ddl_repl_checked_attach_partition(PG_FUNCTION_ARGS)
+{
+	char	   *partition = text_to_cstring(PG_GETARG_TEXT_PP(3));
+	AlterTableCmd *cmd = single_alter_table_cmd(text_to_cstring(PG_GETARG_TEXT_PP(0)),
+												text_to_cstring(PG_GETARG_TEXT_PP(1)),
+												text_to_cstring(PG_GETARG_TEXT_PP(2)), "partition attach");
+	const char *name = (cmd->def != NULL && IsA(cmd->def, PartitionCmd)) ? ((PartitionCmd *) cmd->def)->name->relname : NULL;
+
+	check_subcommand(cmd, AT_AttachPartition, name, partition, "partition attach");
 	PG_RETURN_TEXT_P(PG_GETARG_TEXT_PP(0));
 }

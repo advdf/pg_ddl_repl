@@ -1,5 +1,13 @@
 #include "postgres.h"
 #include "executor/spi.h"
+#include "access/htup_details.h"
+#include "catalog/pg_attrdef.h"
+#include "nodes/readfuncs.h"
+#include "optimizer/optimizer.h"
+#include "utils/fmgroids.h"
+#include "utils/rel.h"
+#include "access/genam.h"
+#include "access/table.h"
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "utils/builtins.h"
@@ -61,4 +69,34 @@ ddl_repl_execute_as(PG_FUNCTION_ARGS)
 	AtEOXact_GUC(false, save_nestlevel);
 	SetUserIdAndSecContext(save_userid, save_sec_context);
 	PG_RETURN_VOID();
+}
+
+/* A non-immutable default (now, nextval, random) gives each node different values: not replicable. */
+PG_FUNCTION_INFO_V1(ddl_repl_default_is_mutable);
+
+Datum
+ddl_repl_default_is_mutable(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	int16		attnum = PG_GETARG_INT16(1);
+	Relation	attrdef = table_open(AttrDefaultRelationId, AccessShareLock);
+	ScanKeyData keys[2];
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	bool		mutable_default = false;
+
+	ScanKeyInit(&keys[0], Anum_pg_attrdef_adrelid, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(relid));
+	ScanKeyInit(&keys[1], Anum_pg_attrdef_adnum, BTEqualStrategyNumber, F_INT2EQ, Int16GetDatum(attnum));
+	scan = systable_beginscan(attrdef, AttrDefaultIndexId, true, NULL, 2, keys);
+	if (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		bool		isnull;
+		Datum		adbin = heap_getattr(tuple, Anum_pg_attrdef_adbin, RelationGetDescr(attrdef), &isnull);
+
+		if (!isnull)
+			mutable_default = contain_mutable_functions(stringToNode(TextDatumGetCString(adbin)));
+	}
+	systable_endscan(scan);
+	table_close(attrdef, AccessShareLock);
+	PG_RETURN_BOOL(mutable_default);
 }

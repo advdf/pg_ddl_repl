@@ -71,16 +71,20 @@ Operations per family:
 
 | family | operations |
 |---|---|
-| `table` | `create_table`, `rename_table`, `drop_table` |
-| `column` | `add_column`, `drop_column`, `rename_column`, `alter_column_type`, `alter_column_default` |
-| `index` | `create_index`, `drop_index` |
+| `table` | `create_table`, `rename_table`, `drop_table`, `attach_partition`, `detach_partition`, `unsupported` |
+| `column` | `add_column` (with its default, generated expression and `NOT NULL`), `drop_column`, `rename_column`, `alter_column_type` (with `USING`), `alter_column_default`, `set_not_null`, `drop_not_null` |
+| `index` | `create_index`, `drop_index`, `rename_index` |
+| `constraint` | `add_constraint` (primary key, unique, check, foreign key, exclusion, `ONLY`, `USING INDEX`), `drop_constraint`, `rename_constraint`, `validate_constraint`, `alter_constraint` (deferrability; on PostgreSQL 18 also enforceability and inheritability) |
+
+`unsupported` reports schema changes that have no replay (identity and generated-expression changes, inheritance, typed tables, replica identity, logged/unlogged, `SET SCHEMA`, non-immutable (e.g. `now()`, `nextval()`) or identity column defaults, in which case the column's `NOT NULL` is not replicated either): the subscriber logs a warning and leaves the row with `applied_at` NULL instead of diverging silently. On PostgreSQL 18 a named `NOT NULL` constraint keeps its name and `NOT VALID` on the subscriber.
 
 ## Known v1 limitations
 
 - **`create_table` is audit-only, never replayed.** The structured deparse doesn't capture a column list (see `src/deparse_table.c`). The DBA is expected to pre-create tables on subscribers before subscribing, same as native logical replication already requires for DML.
-- **`alter_column_default` is audit-only unless a table opts in.** The new default expression isn't deparsed structurally (would require core's general expression deparser, out of scope for v1). Opt in with `ddl_repl.enable_raw_fallback(source_name, schema, table)` to replay the captured text instead — a single `ALTER ... SET/DROP DEFAULT` statement rebuilt from the catalogs at capture time (fully table-qualified, never the client's verbatim input). Still off by default because names *inside* the default expression are rendered relative to the publisher's `search_path` and may resolve differently on the subscriber.
-- **Renaming a table invalidates subscribe-side rules keyed on the old name.** Since `subscribe_rules` keys on name, a `drop_table` (or any later operation) on the renamed table needs its own rule for the *new* name.
-- **Constraints (`NOT NULL`, `CHECK`) are not captured at all.** `logical_ddl` doesn't handle these either; deparsing them correctly (named vs. auto-named constraints) is nontrivial and deferred.
+- **`alter_column_default` is audit-only unless a table opts in.** The new default expression isn't deparsed structurally (would require core's general expression deparser, out of scope for v1). Opt in with `ddl_repl.enable_raw_fallback(source_name, schema, table)` to replay the captured text instead — a single `ALTER ... SET/DROP DEFAULT` statement rebuilt from the catalogs at capture time (fully table-qualified, never the client's verbatim input). Still off by default because every object the default expression names must exist on the subscriber (names are schema-qualified at capture).
+- **Constraints replicate by default, so what they reference must exist on the subscriber.** A `CHECK` calling a function or a foreign key referencing a table missing there stops apply. A replayed `ADD CONSTRAINT` whose name already exists on the table is skipped; a primary key named differently on the subscriber is refused with an explicit error. `NOT NULL` always travels as `set_not_null` / `drop_not_null`.
+- **Drops are replayed without `CASCADE`.** Dependents dropped on the publisher (foreign keys, checks) are captured and replayed first; a dependent that exists only on the subscriber, or that sits on a table whose drops are not published, stops apply instead of being dropped silently.
+- **The install script is not versioned yet.** Changes still go into `pg_ddl_repl--1.0.sql` in place; versioned upgrade scripts start with the first production install.
 - **Topology is simple 1 publisher → N subscribers.** Loop prevention keys off `session_replication_role = 'replica'` (how apply workers always run, and superuser-only — no unprivileged role can set it to sneak DDL past capture); true bidirectional replication, where each side both publishes and subscribes the same tables, would need more than that.
 - **No automated crash/restart idempotency test.** The apply path guards with `IF EXISTS`/`IF NOT EXISTS` and a `(source_name, id)` primary key, but this hasn't been exercised under an actual subscriber crash-and-replay in CI.
 
@@ -102,5 +106,7 @@ No local PostgreSQL source build handy? The CI image (also used by GitHub Action
 docker build -f ci/Dockerfile --build-arg PG_VERSION=17.5 -t pg_ddl_repl-ci .
 docker run --rm pg_ddl_repl-ci
 ```
+
+`t/030_ddl_fuzz.pl` is a differential test: it runs seeded random sequences of supported DDL (and DML) on a publisher and, after each batch, requires the subscriber's tables to match (columns, defaults, `NOT NULL`, constraints, indexes, rows) with apply still running. A failure prints the seed and the statements; widen or replay a run with `DDL_FUZZ_SEEDS="9 10 11" DDL_FUZZ_STEPS=80`.
 
 Covers: table/column/index capture and replay, filtering (publish- and subscribe-side, default-deny, wildcard-vs-specific precedence), the opt-in raw-text fallback, multi-subscriber fan-out with independent filter sets, and same-transaction DDL+DML ordering.
