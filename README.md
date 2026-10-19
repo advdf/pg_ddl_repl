@@ -58,7 +58,7 @@ VALUES ('table', 'create_table');
 SELECT ddl_repl.subscribe_table('my_publisher_source_name', 'public', 'orders');
 ```
 
-`my_publisher_source_name` defaults to the publisher's `cluster_name` GUC (falling back to its database name if unset) — override explicitly with the `ddl_repl.source_name` GUC if that's ambiguous in your topology.
+`my_publisher_source_name` defaults to the publisher's `cluster_name` GUC (falling back to its database name if unset) — override explicitly with the `ddl_repl.source_name` GUC if that's ambiguous in your topology. It is superuser-only (`SUSET`): set it in `postgresql.conf` / `ALTER SYSTEM`, or from a superuser session. Before PostgreSQL 17, `ALTER SYSTEM` only accepts it after `LOAD 'pg_ddl_repl'` in the same session.
 
 ## Filtering model
 

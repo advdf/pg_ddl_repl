@@ -35,7 +35,7 @@ ddl_repl_deparse_index(PG_FUNCTION_ARGS)
 	MemoryContext oldcontext;
 	AttInMetadata *attinmeta;
 	bool		randomAccess;
-	char	   *values[3];
+	char	   *values[3] = {0};
 	bool		matched = false;
 
 	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
@@ -63,7 +63,6 @@ ddl_repl_deparse_index(PG_FUNCTION_ARGS)
 	MemoryContextSwitchTo(oldcontext);
 	attinmeta = TupleDescGetAttInMetadata(tupdesc);
 
-	memset(values, 0, sizeof(values));
 
 	if (cmd->type == SCT_Simple && IsA(cmd->parsetree, IndexStmt))
 	{

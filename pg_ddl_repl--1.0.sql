@@ -43,7 +43,8 @@ RETURNS TABLE (
     column_name text,
     new_name text,
     type_name text,
-    table_oid oid
+    table_oid oid,
+    using_expr text
 )
 LANGUAGE c
 AS 'MODULE_PATHNAME', 'ddl_repl_deparse_column';
@@ -58,6 +59,33 @@ RETURNS TABLE (
 )
 LANGUAGE c
 AS 'MODULE_PATHNAME', 'ddl_repl_deparse_index';
+
+-- Apply-side checks on queue text before it is executed: each raises unless the text is the one expected statement.
+CREATE FUNCTION ddl_repl.canonical_type(type_name text)
+RETURNS text
+LANGUAGE c STRICT STABLE
+AS 'MODULE_PATHNAME', 'ddl_repl_canonical_type';
+
+CREATE FUNCTION ddl_repl.checked_index_def(index_def text, schema_name text, table_name text, index_name text)
+RETURNS text
+LANGUAGE c STRICT IMMUTABLE
+AS 'MODULE_PATHNAME', 'ddl_repl_checked_index_def';
+
+CREATE FUNCTION ddl_repl.checked_alter_default(ddl_text text, schema_name text, table_name text, column_name text)
+RETURNS text
+LANGUAGE c STRICT IMMUTABLE
+AS 'MODULE_PATHNAME', 'ddl_repl_checked_alter_default';
+
+CREATE FUNCTION ddl_repl.checked_alter_type(ddl_text text, schema_name text, table_name text, column_name text)
+RETURNS text
+LANGUAGE c STRICT IMMUTABLE
+AS 'MODULE_PATHNAME', 'ddl_repl_checked_alter_type';
+
+CREATE FUNCTION ddl_repl.execute_as(sql text, role oid)
+RETURNS void
+LANGUAGE c STRICT
+AS 'MODULE_PATHNAME', 'ddl_repl_execute_as';
+REVOKE ALL ON FUNCTION ddl_repl.execute_as(text, oid) FROM PUBLIC;
 
 -- By the time DROP INDEX fires sql_drop, pg_index no longer has the row --
 -- confirmed empirically (indrelid lookup by indexrelid returns NULL at that
@@ -102,23 +130,19 @@ CREATE TABLE ddl_repl.subscribe_rules (
     object_family text NOT NULL CHECK (object_family IN ('table', 'column', 'index')),
     operation text NOT NULL,
     enabled boolean NOT NULL DEFAULT true,
-    -- Opt-in only: replay the captured command text for operations without
-    -- a structured deparse (currently just 'alter_column_default') instead
-    -- of leaving them as an audit-only, unapplied row. The text is a single
-    -- statement rebuilt from the catalogs at capture time (see
-    -- build_alter_default_sql), never the client's verbatim input. Still
-    -- off by default -- names inside the default expression are rendered
-    -- relative to the publisher's search_path and may resolve differently
-    -- on the subscriber.
+    -- Opt-in: replay the catalog-rebuilt, schema-qualified ALTER ... SET/DROP DEFAULT for 'alter_column_default'.
+    -- Off by default: every object the default expression names must exist on the subscriber.
     allow_raw_fallback boolean NOT NULL DEFAULT false,
     CHECK ((schema_name IS NULL) = (table_name IS NULL)),
     UNIQUE NULLS NOT DISTINCT (source_name, schema_name, table_name, object_family, operation)
 );
 
+-- Temporary tables are session-local: never replicated, whatever the rules say.
 CREATE FUNCTION ddl_repl.is_published(p_relid oid, p_family text, p_operation text)
 RETURNS boolean
 LANGUAGE sql STABLE AS $$
-    SELECT coalesce(
+    SELECT NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class WHERE oid = p_relid AND relpersistence = 't')
+    AND coalesce(
         (SELECT enabled FROM ddl_repl.publish_rules
          WHERE object_family = p_family AND operation = p_operation
            AND (relid = p_relid OR relid IS NULL)
@@ -187,7 +211,16 @@ LANGUAGE sql AS $$
         (p_relid, 'column', 'alter_column_default'),
         (p_relid, 'index', 'create_index'),
         (p_relid, 'index', 'drop_index')
-    ON CONFLICT (relid, object_family, operation) DO UPDATE SET enabled = true
+    ON CONFLICT (relid, object_family, operation) DO UPDATE SET enabled = true;
+
+    -- Indexes created before the table was published must be droppable too.
+    INSERT INTO ddl_repl.index_table_map (index_oid, table_oid, schema_name, table_name)
+    SELECT i.indexrelid, c.oid, n.nspname, c.relname
+    FROM pg_catalog.pg_index i
+    JOIN pg_catalog.pg_class c ON c.oid = i.indrelid
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    WHERE i.indrelid = p_relid
+    ON CONFLICT (index_oid) DO NOTHING;
 $$;
 
 CREATE FUNCTION ddl_repl.subscribe_table(p_source_name text, p_schema text, p_table text)
@@ -206,6 +239,24 @@ LANGUAGE sql AS $$
         (p_source_name, p_schema, p_table, 'index', 'create_index'),
         (p_source_name, p_schema, p_table, 'index', 'drop_index')
     ON CONFLICT (source_name, schema_name, table_name, object_family, operation) DO UPDATE SET enabled = true
+$$;
+
+-- ddl_repl.source_name is a SUSET parameter defined by the library: only the server config or a superuser can set it.
+CREATE FUNCTION ddl_repl.source_name_override()
+RETURNS text
+LANGUAGE c STABLE
+AS 'MODULE_PATHNAME', 'ddl_repl_source_name_override';
+
+CREATE FUNCTION ddl_repl.source_name()
+RETURNS text
+LANGUAGE sql STABLE
+SET search_path = pg_catalog, pg_temp
+AS $$
+    SELECT coalesce(
+        ddl_repl.source_name_override(),
+        nullif(current_setting('cluster_name', true), ''),
+        current_database()
+    )
 $$;
 
 -- Rebuild a single, self-contained, fully table-qualified ALTER ... SET/DROP
@@ -233,18 +284,17 @@ LANGUAGE sql STABLE AS $$
     WHERE c.oid = p_relid
 $$;
 
+-- Event triggers fire for every role: run as the extension owner, so ordinary roles need no rights on ddl_repl.
 CREATE FUNCTION ddl_repl.capture_ddl_command_end()
 RETURNS event_trigger
 LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
     obj record;
     line record;
-    v_source text := coalesce(
-        current_setting('ddl_repl.source_name', true),
-        nullif(current_setting('cluster_name', true), ''),
-        current_database()
-    );
+    v_source text := ddl_repl.source_name();
 BEGIN
     -- Loop-prevention: logical replication apply workers run with
     -- session_replication_role = 'replica' (the same fact ENABLE REPLICA
@@ -277,6 +327,10 @@ BEGIN
                     )
                 );
             END IF;
+
+            IF line.operation = 'rename_table' THEN
+                UPDATE ddl_repl.index_table_map SET table_name = line.new_name WHERE table_oid = line.table_oid;
+            END IF;
         END LOOP;
 
         FOR line IN SELECT * FROM ddl_repl.deparse_column(obj.command)
@@ -295,6 +349,7 @@ BEGIN
                         'column_name', line.column_name,
                         'new_name', line.new_name,
                         'type_name', line.type_name,
+                        'using_expr', line.using_expr,
                         -- Only 'alter_column_default' relies on this: the new
                         -- default expression isn't deparsed structurally (see
                         -- deparse_column.c), so a single rebuilt statement is
@@ -330,7 +385,11 @@ BEGIN
                             -- Full CREATE INDEX text from the OID, not
                             -- hand-walked from the parse tree -- see
                             -- deparse_index.c.
-                            'index_def', pg_get_indexdef(line.index_oid)
+                            -- A valid partitioned index was built on every partition: replay it without ONLY.
+                            'index_def', CASE WHEN (SELECT c.relkind = 'I' AND i.indisvalid FROM pg_class c
+                                                    JOIN pg_index i ON i.indexrelid = c.oid WHERE c.oid = line.index_oid)
+                                              THEN replace(pg_get_indexdef(line.index_oid), ' ON ONLY ', ' ON ')
+                                              ELSE pg_get_indexdef(line.index_oid) END
                         )
                     );
                 END IF;
@@ -350,14 +409,12 @@ CREATE EVENT TRIGGER ddl_repl_capture_ddl_command_end
 CREATE FUNCTION ddl_repl.capture_sql_drop()
 RETURNS event_trigger
 LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
     obj record;
-    v_source text := coalesce(
-        current_setting('ddl_repl.source_name', true),
-        nullif(current_setting('cluster_name', true), ''),
-        current_database()
-    );
+    v_source text := ddl_repl.source_name();
 BEGIN
     -- Same loop-prevention as capture_ddl_command_end: skip while a
     -- subscription apply worker (session_replication_role = 'replica') is
@@ -368,7 +425,7 @@ BEGIN
 
     FOR obj IN
         SELECT * FROM pg_event_trigger_dropped_objects()
-        WHERE object_type IN ('table', 'table column', 'index')
+        WHERE object_type IN ('table', 'table column', 'index') AND NOT is_temporary
     LOOP
         IF obj.object_type = 'table' THEN
             IF ddl_repl.is_published(obj.objid, 'table', 'drop_table') THEN
@@ -472,7 +529,7 @@ DECLARE
     v_index text := NEW.payload->>'index_name';
     v_index_def text := NEW.payload->>'index_def';
     v_sql text;
-    v_old_path text;
+    v_owner oid;
 BEGIN
     IF v_family NOT IN ('table', 'column', 'index') THEN
         RETURN NEW;
@@ -485,6 +542,18 @@ BEGIN
     CASE v_op
         WHEN 'rename_table' THEN
             v_sql := format('ALTER TABLE IF EXISTS %I.%I RENAME TO %I', v_schema, v_table, v_new_name);
+            -- Rules are keyed by name and describe this node's table, so every source's rules follow the rename;
+            -- a rule already set on the new name wins.
+            DELETE FROM ddl_repl.subscribe_rules o
+            WHERE o.schema_name = v_schema AND o.table_name = v_table
+              AND EXISTS (SELECT 1 FROM ddl_repl.subscribe_rules n
+                          WHERE n.source_name = o.source_name AND n.schema_name = o.schema_name
+                            AND n.table_name = v_new_name
+                            AND n.object_family = o.object_family AND n.operation = o.operation);
+            UPDATE ddl_repl.subscribe_rules SET table_name = v_new_name
+            WHERE schema_name = v_schema AND table_name = v_table;
+            UPDATE ddl_repl.index_table_map SET table_name = v_new_name
+            WHERE schema_name = v_schema AND table_name = v_table;
         WHEN 'drop_table' THEN
             v_sql := format('DROP TABLE IF EXISTS %I.%I', v_schema, v_table);
         WHEN 'create_table' THEN
@@ -493,7 +562,7 @@ BEGIN
             v_sql := NULL;
         WHEN 'add_column' THEN
             v_sql := format('ALTER TABLE IF EXISTS %I.%I ADD COLUMN IF NOT EXISTS %I %s',
-                             v_schema, v_table, v_column, v_type);
+                             v_schema, v_table, v_column, ddl_repl.canonical_type(v_type));
         WHEN 'drop_column' THEN
             v_sql := format('ALTER TABLE IF EXISTS %I.%I DROP COLUMN IF EXISTS %I',
                              v_schema, v_table, v_column);
@@ -502,23 +571,18 @@ BEGIN
                              v_schema, v_table, v_column, v_new_name);
         WHEN 'alter_column_type' THEN
             v_sql := format('ALTER TABLE IF EXISTS %I.%I ALTER COLUMN %I TYPE %s',
-                             v_schema, v_table, v_column, v_type);
+                             v_schema, v_table, v_column, ddl_repl.canonical_type(v_type));
+            IF NEW.payload->>'using_expr' IS NOT NULL THEN
+                v_sql := ddl_repl.checked_alter_type(v_sql || ' USING ' || (NEW.payload->>'using_expr'),
+                                                     v_schema, v_table, v_column);
+            END IF;
         WHEN 'alter_column_default' THEN
             -- The default expression isn't deparsed structurally (see
             -- deparse_column.c) -- logged for audit, not replayed unless
             -- this table has opted in to raw-text fallback (see
             -- ddl_repl.enable_raw_fallback).
             IF ddl_repl.allows_raw_fallback(NEW.source_name, v_schema, v_table, v_family, v_op) THEN
-                v_sql := NEW.payload->>'ddl_text';
-                -- ddl_text fully qualifies the table (see
-                -- build_alter_default_sql), but names *inside* the default
-                -- expression are rendered by pg_get_expr relative to the
-                -- publisher's search_path -- approximate that here with the
-                -- table's schema (quoted: it may need it), and restore the
-                -- previous path after EXECUTE so it can't leak into later
-                -- rows applied in this same transaction.
-                v_old_path := current_setting('search_path');
-                PERFORM set_config('search_path', quote_ident(v_schema), true);
+                v_sql := ddl_repl.checked_alter_default(NEW.payload->>'ddl_text', v_schema, v_table, v_column);
             ELSE
                 v_sql := NULL;
             END IF;
@@ -528,7 +592,9 @@ BEGIN
             -- complete (columns, opclasses, WHERE clause, INCLUDE, storage
             -- params) -- inject IF NOT EXISTS for idempotency since
             -- pg_get_indexdef() never includes it.
-            v_sql := regexp_replace(v_index_def, '^(CREATE (UNIQUE )?INDEX )', '\1IF NOT EXISTS ');
+            v_sql := ddl_repl.checked_index_def(
+                regexp_replace(v_index_def, '^(CREATE (UNIQUE )?INDEX )', '\1IF NOT EXISTS '),
+                v_schema, v_table, v_index);
         WHEN 'drop_index' THEN
             v_sql := format('DROP INDEX IF EXISTS %I.%I', v_schema, v_index);
         ELSE
@@ -539,11 +605,18 @@ BEGIN
         -- No loop-prevention flag to set here: this trigger only ever fires
         -- under session_replication_role = 'replica' (ENABLE REPLICA
         -- TRIGGER), which is exactly what the capture triggers check.
-        EXECUTE v_sql;
-
-        IF v_old_path IS NOT NULL THEN
-            PERFORM set_config('search_path', v_old_path, true);
+        -- Run as the table owner, like logical replication applies DML: a replayed row can do no more than the owner.
+        -- No owner resolved (table gone, or an index of another table): skip rather than run as the apply role.
+        SELECT c.relowner INTO v_owner
+        FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = v_schema AND c.relname = v_table AND c.relkind IN ('r', 'p')
+          AND (v_op <> 'drop_index' OR EXISTS (
+                SELECT 1 FROM pg_index i JOIN pg_class x ON x.oid = i.indexrelid
+                WHERE i.indrelid = c.oid AND x.relname = v_index AND x.relnamespace = n.oid));
+        IF v_owner IS NULL THEN
+            RETURN NEW;
         END IF;
+        PERFORM ddl_repl.execute_as(v_sql, v_owner);
 
         UPDATE ddl_repl.command_queue
             SET applied_at = now()

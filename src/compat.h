@@ -19,4 +19,13 @@
 #define DDL_REPL_IS_DROP_COLUMN(subtype) ((subtype) == AT_DropColumn)
 #endif
 
+/* parseTypeString() took a missing_ok flag before PG16, a soft-error context since. */
+#if PG_VERSION_NUM < 160000
+#define DDL_REPL_PARSE_TYPE_STRING(str, typid, typmod) \
+	parseTypeString((str), (typid), (typmod), false)
+#else
+#define DDL_REPL_PARSE_TYPE_STRING(str, typid, typmod) \
+	((void) parseTypeString((str), (typid), (typmod), NULL))
+#endif
+
 #endif							/* DDL_REPL_COMPAT_H */
