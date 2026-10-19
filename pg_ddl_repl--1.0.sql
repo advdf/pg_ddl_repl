@@ -1052,6 +1052,12 @@ BEGIN
                 SELECT 1 FROM pg_index i JOIN pg_class x ON x.oid = i.indexrelid
                 WHERE i.indrelid = c.oid AND x.relname = v_index AND x.relnamespace = c.relnamespace));
         IF v_owner IS NULL THEN
+            -- A drop whose object an earlier replayed drop (table, partition parent, constraint) already removed.
+            IF (v_op IN ('drop_table', 'drop_column', 'drop_constraint') AND v_relid IS NULL)
+               OR (v_op = 'drop_index' AND to_regclass(quote_ident(v_schema) || '.' || quote_ident(v_index)) IS NULL) THEN
+                UPDATE ddl_repl.command_queue SET applied_at = now()
+                WHERE id = NEW.id AND source_name = NEW.source_name;
+            END IF;
             RETURN NEW;
         END IF;
         IF v_redefine_sql IS NOT NULL THEN

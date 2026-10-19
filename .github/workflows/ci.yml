@@ -16,7 +16,7 @@ jobs:
       fail-fast: false
       matrix:
         # One entry per supported major; bump the minors here.
-        pg: ["15.13", "16.9", "17.5", "18.0"]
+        pg: ["15.13", "16.9", "17.5", "18.4"]
     steps:
       - uses: actions/checkout@v4
 
