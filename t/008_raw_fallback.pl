@@ -17,6 +17,8 @@ for my $node ($publisher, $subscriber)
 {
     $node->safe_psql('postgres', 'CREATE EXTENSION pg_ddl_repl;');
     $node->safe_psql('postgres', 'CREATE TABLE t_orders (id int, amount numeric)');
+    $node->safe_psql('postgres', 'CREATE SCHEMA lib');
+    $node->safe_psql('postgres', 'CREATE FUNCTION lib.seven() RETURNS numeric LANGUAGE sql IMMUTABLE AS $$ SELECT 7 $$');
 }
 
 $publisher->safe_psql('postgres', q(SELECT ddl_repl.publish_table('t_orders'::regclass)));
@@ -79,6 +81,17 @@ is($subscriber->safe_psql('postgres',
         q(SELECT column_default IS NULL FROM information_schema.columns WHERE table_name = 't_orders' AND column_name = 'amount')),
     't',
     'DROP DEFAULT replays via the same rebuilt-statement fallback');
+
+$publisher->safe_psql('postgres', q(
+    SET search_path = lib, public;
+    ALTER TABLE t_orders ALTER COLUMN amount SET DEFAULT seven();
+));
+$publisher->wait_for_catchup('sub1');
+
+is($subscriber->safe_psql('postgres',
+        q(SELECT column_default FROM information_schema.columns WHERE table_name = 't_orders' AND column_name = 'amount')),
+    'lib.seven()',
+    'a default naming an object outside the subscriber search_path replays schema-qualified');
 
 $subscriber->stop;
 $publisher->stop;

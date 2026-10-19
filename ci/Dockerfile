@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libreadline-dev zlib1g-dev libicu-dev pkg-config \
         perl libipc-run-perl \
         curl ca-certificates \
+    && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
 # --enable-cassert: assertion-checked build, catches C-level bugs in the
@@ -20,6 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # The two extra install steps put pg_regress and the PostgreSQL::Test perl
 # modules into the install tree's pgxs directory -- that is where a PGXS
 # TAP_TESTS installcheck resolves them from, letting us drop the source tree.
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 RUN curl -fsSL "https://ftp.postgresql.org/pub/source/v${PG_VERSION}/postgresql-${PG_VERSION}.tar.gz" \
         | tar -xz -C /usr/src \
     && cd "/usr/src/postgresql-${PG_VERSION}" \
@@ -38,8 +40,7 @@ RUN useradd --create-home postgres
 WORKDIR /workspace
 COPY --chown=postgres:postgres . .
 
-# chown the directory itself too (WORKDIR created it as root; COPY --chown
-# only covers the copied entries) -- installcheck writes tmp_check/ there.
+# chown the directory itself too: COPY --chown leaves it root-owned and installcheck writes tmp_check/ there.
 RUN make && make install && chown postgres:postgres /workspace
 
 USER postgres

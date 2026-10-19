@@ -29,7 +29,7 @@ ddl_repl_deparse_table(PG_FUNCTION_ARGS)
 	MemoryContext oldcontext;
 	AttInMetadata *attinmeta;
 	bool		randomAccess;
-	char	   *values[4];
+	char	   *values[4] = {0};
 	bool		matched = false;
 
 	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
@@ -58,7 +58,6 @@ ddl_repl_deparse_table(PG_FUNCTION_ARGS)
 	MemoryContextSwitchTo(oldcontext);
 	attinmeta = TupleDescGetAttInMetadata(tupdesc);
 
-	memset(values, 0, sizeof(values));
 
 	if (cmd->type == SCT_Simple)
 	{
